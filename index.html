@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Мой IP</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #8a8a8e);
+    --card: var(--tg-theme-secondary-bg-color, #f2f2f7);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--hint); margin: 4px 0 8px; }
+  .ip { font: 600 26px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; margin: 0 0 4px; }
+  .sub { color: var(--hint); font-size: 13px; margin-bottom: 18px; }
+  .card { background: var(--card); border-radius: 12px; padding: 4px 14px; margin-bottom: 14px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid color-mix(in srgb, var(--hint) 25%, transparent); }
+  .row:last-child { border-bottom: 0; }
+  .row span:first-child { color: var(--hint); flex-shrink: 0; }
+  .row span:last-child { text-align: right; word-break: break-word; }
+  .note { color: var(--hint); font-size: 12px; }
+  .err { color: #d93025; }
+  button#send {
+    display: none; width: 100%; padding: 13px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-text); font-size: 15px; font-weight: 600;
+  }
+</style>
+</head>
+<body>
+  <h1>Ваш IP глазами сайтов</h1>
+  <div id="ip4" class="ip">Определяю…</div>
+  <div id="ip6" class="sub"></div>
+
+  <div id="details" class="card" style="display:none"></div>
+
+  <button id="send">Отправить в бота для подробного отчёта</button>
+  <p class="note">Адрес определяется запросом прямо с этого устройства, поэтому учитываются VPN и прокси, если они включены.</p>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+const result = { ipv4: null, ipv6: null };
+
+async function getJSON(url, ms = 7000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+function row(label, value) {
+  if (value === undefined || value === null || value === "") return "";
+  const esc = String(value).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  return `<div class="row"><span>${label}</span><span>${esc}</span></div>`;
+}
+
+async function main() {
+  // IPv4 и (если есть) IPv6 — параллельно
+  const [v4, v64] = await Promise.allSettled([
+    getJSON("https://api.ipify.org?format=json"),
+    getJSON("https://api64.ipify.org?format=json"),
+  ]);
+  if (v4.status === "fulfilled") result.ipv4 = v4.value.ip;
+  if (v64.status === "fulfilled" && v64.value.ip.includes(":")) result.ipv6 = v64.value.ip;
+
+  const primary = result.ipv4 || result.ipv6;
+  const ip4El = document.getElementById("ip4");
+  if (!primary) {
+    ip4El.innerHTML = '<span class="err">Не удалось определить IP</span>';
+    return;
+  }
+  ip4El.textContent = primary;
+  if (result.ipv4 && result.ipv6) {
+    document.getElementById("ip6").textContent = "IPv6: " + result.ipv6;
+  } else {
+    document.getElementById("ip6").textContent = result.ipv6 ? "IPv6" : "IPv4 · IPv6 не обнаружен";
+  }
+
+  // Краткая сводка прямо в приложении
+  try {
+    const d = await getJSON("https://ipwho.is/" + primary);
+    if (d.success) {
+      const c = d.connection || {};
+      const flag = (d.flag && d.flag.emoji) || "";
+      const box = document.getElementById("details");
+      box.innerHTML =
+        row("Страна", `${flag} ${d.country}`) +
+        row("Регион", d.region) +
+        row("Город", d.city) +
+        row("Провайдер", c.isp) +
+        row("Организация", c.org !== c.isp ? c.org : "") +
+        row("ASN", c.asn ? "AS" + c.asn : "") +
+        row("Часовой пояс", d.timezone && d.timezone.id);
+      box.style.display = "block";
+    }
+  } catch (e) { /* сводка необязательна — подробности даст бот */ }
+
+  // platform === "unknown" — страница открыта в обычном браузере, а не в Telegram
+  if (tg && tg.platform && tg.platform !== "unknown") {
+    const btn = document.getElementById("send");
+    btn.style.display = "block";
+    btn.onclick = () => tg.sendData(JSON.stringify(result));
+  }
+}
+
+main();
+</script>
+</body>
+</html>
