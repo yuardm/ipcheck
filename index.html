@@ -50,69 +50,115 @@ const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 
 const result = { ipv4: null, ipv6: null };
+const isIP = s => typeof s === "string" && /^[0-9a-f.:]+$/i.test(s.trim()) && (s.includes(".") || s.includes(":"));
 
-async function getJSON(url, ms = 7000) {
+async function fetchText(url, ms = 10000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
     const r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
-    return await r.json();
+    return await r.text();
+  } catch (e) {
+    throw new Error(e.name === "AbortError" ? "таймаут" : (e.message || "ошибка"));
   } finally { clearTimeout(t); }
 }
 
+// Сервисы на разных доменах: если VPN/блокировщик закроет часть из них, сработают другие.
+const json = key => txt => JSON.parse(txt)[key];
+const trace = txt => (txt.match(/^ip=(.+)$/m) || [])[1];
+const plain = txt => txt.trim();
+const PROVIDERS = [
+  ["cloudflare.com", "https://www.cloudflare.com/cdn-cgi/trace", trace],
+  ["ipify.org",      "https://api64.ipify.org?format=json",      json("ip")],
+  ["ipwho.is",       "https://ipwho.is/",                         json("ip")],
+  ["icanhazip.com",  "https://icanhazip.com/",                    plain],
+  ["1.1.1.1",        "https://1.1.1.1/cdn-cgi/trace",             trace],
+  ["ipapi.co",       "https://ipapi.co/json/",                    json("ip")],
+  ["geojs.io",       "https://get.geojs.io/v1/ip.json",           json("ip")],
+  ["ipinfo.io",      "https://ipinfo.io/json",                    json("ip")],
+  ["seeip.org",      "https://api.seeip.org/jsonip",              json("ip")],
+  ["freeipapi.com",  "https://free.freeipapi.com/api/json",       json("ipAddress")],
+];
+const V4_ONLY = [
+  ["ipify.org v4",     "https://api.ipify.org?format=json", json("ip")],
+  ["icanhazip.com v4", "https://ipv4.icanhazip.com/",       plain],
+];
+
+const failures = [];
+function ask([name, url, parse]) {
+  return fetchText(url).then(txt => {
+    const ip = (parse(txt) || "").trim();
+    if (!isIP(ip)) throw new Error("непонятный ответ");
+    return ip;
+  }).catch(e => { failures.push(`${name}: ${e.message}`); throw e; });
+}
+
 function row(label, value) {
-  if (value === undefined || value === null || value === "") return "";
+  if (value === undefined || value === null || value === "" || value === "undefined") return "";
   const esc = String(value).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   return `<div class="row"><span>${label}</span><span>${esc}</span></div>`;
 }
 
+async function geoSummary(ip) {
+  const sources = [
+    async () => { const d = JSON.parse(await fetchText("https://ipwho.is/" + ip)); if (!d.success) throw 0;
+      const c = d.connection || {};
+      return { country: `${(d.flag && d.flag.emoji) || ""} ${d.country}`, region: d.region, city: d.city,
+               isp: c.isp, org: c.org, asn: c.asn && "AS" + c.asn, tz: d.timezone && d.timezone.id }; },
+    async () => { const d = JSON.parse(await fetchText(`https://ipapi.co/${ip}/json/`)); if (d.error) throw 0;
+      return { country: d.country_name, region: d.region, city: d.city, isp: d.org, asn: d.asn, tz: d.timezone }; },
+    async () => { const d = JSON.parse(await fetchText(`https://get.geojs.io/v1/ip/geo/${ip}.json`));
+      return { country: d.country, region: d.region, city: d.city, isp: d.organization_name,
+               asn: d.asn && "AS" + d.asn, tz: d.timezone }; },
+  ];
+  for (const s of sources) { try { return await s(); } catch (e) { /* следующий */ } }
+  return null;
+}
+
 async function main() {
-  // IPv4 и (если есть) IPv6 — параллельно
-  const [v4, v64] = await Promise.allSettled([
-    getJSON("https://api.ipify.org?format=json"),
-    getJSON("https://api64.ipify.org?format=json"),
-  ]);
-  if (v4.status === "fulfilled") result.ipv4 = v4.value.ip;
-  if (v64.status === "fulfilled" && v64.value.ip.includes(":")) result.ipv6 = v64.value.ip;
+  // Первый успешный ответ из всех сервисов (обычно IPv6, если он есть, иначе IPv4)
+  let any;
+  try { any = await Promise.any(PROVIDERS.map(ask)); } catch (e) { any = null; }
+
+  if (any && any.includes(":")) {
+    result.ipv6 = any;
+    try { result.ipv4 = await Promise.any(V4_ONLY.map(ask)); } catch (e) { /* только IPv6 */ }
+  } else if (any) {
+    result.ipv4 = any;
+  }
 
   const primary = result.ipv4 || result.ipv6;
   const ip4El = document.getElementById("ip4");
   if (!primary) {
     ip4El.innerHTML = '<span class="err">Не удалось определить IP</span>';
+    document.getElementById("ip6").innerHTML =
+      "Все сервисы определения IP недоступны с этого устройства. Частая причина — блокировка " +
+      "трекеров/рекламы во VPN (например, NetShield в Proton VPN) или фильтр в DNS. " +
+      "Попробуйте временно отключить блокировку и открыть приложение снова.<br><br>" +
+      "<small>" + failures.map(f => f.replace(/[<>&]/g, "")).join("<br>") + "</small>";
     return;
   }
   ip4El.textContent = primary;
-  if (result.ipv4 && result.ipv6) {
-    document.getElementById("ip6").textContent = "IPv6: " + result.ipv6;
-  } else {
-    document.getElementById("ip6").textContent = result.ipv6 ? "IPv6" : "IPv4 · IPv6 не обнаружен";
-  }
+  document.getElementById("ip6").textContent =
+    result.ipv4 && result.ipv6 ? "IPv6: " + result.ipv6 : (result.ipv6 ? "IPv6" : "IPv4");
 
-  // Краткая сводка прямо в приложении
-  try {
-    const d = await getJSON("https://ipwho.is/" + primary);
-    if (d.success) {
-      const c = d.connection || {};
-      const flag = (d.flag && d.flag.emoji) || "";
-      const box = document.getElementById("details");
-      box.innerHTML =
-        row("Страна", `${flag} ${d.country}`) +
-        row("Регион", d.region) +
-        row("Город", d.city) +
-        row("Провайдер", c.isp) +
-        row("Организация", c.org !== c.isp ? c.org : "") +
-        row("ASN", c.asn ? "AS" + c.asn : "") +
-        row("Часовой пояс", d.timezone && d.timezone.id);
-      box.style.display = "block";
-    }
-  } catch (e) { /* сводка необязательна — подробности даст бот */ }
-
+  // Отправка в бота доступна сразу, не дожидаясь сводки
   // platform === "unknown" — страница открыта в обычном браузере, а не в Telegram
   if (tg && tg.platform && tg.platform !== "unknown") {
     const btn = document.getElementById("send");
     btn.style.display = "block";
     btn.onclick = () => tg.sendData(JSON.stringify(result));
+  }
+
+  const d = await geoSummary(primary);
+  if (d) {
+    const box = document.getElementById("details");
+    box.innerHTML =
+      row("Страна", d.country) + row("Регион", d.region) + row("Город", d.city) +
+      row("Провайдер", d.isp) + row("Организация", d.org !== d.isp ? d.org : "") +
+      row("ASN", d.asn) + row("Часовой пояс", d.tz);
+    box.style.display = "block";
   }
 }
 
